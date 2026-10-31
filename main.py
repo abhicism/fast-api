@@ -1,160 +1,187 @@
+# Import FastAPI to create our API application
+# Depends is used for dependency injection
+# HTTPException is used to return HTTP errors
+from fastapi import FastAPI, Depends, HTTPException
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+# BaseModel validates incoming data
+# ConfigDict configures Pydantic model behavior
+from pydantic import BaseModel, ConfigDict
+
+# Import SQL data types and SELECT query builder
+from sqlalchemy import String, Boolean, Integer, select
+
+# Session manages database operations
+# Mapped and mapped_column define database table columns
+from sqlalchemy.orm import Session, Mapped, mapped_column
+
+# Import database configuration
+# Base is the parent class for database models
+# engine connects SQLAlchemy to PostgreSQL
+# get_db provides and closes database sessions
+from database import Base, engine, get_db
+
 
 # Create the FastAPI application
 app = FastAPI(title="TaskFlow API")
 
 
-# Pydantic model: validates incoming task data
-class Task(BaseModel):
+# ==========================================
+# 1. SQLALCHEMY MODEL
+# ==========================================
+
+# This class defines the actual PostgreSQL table
+class TaskDB(Base):
+
+    # Name of the table in PostgreSQL
+    __tablename__ = "tasks"
+
+    # Define the ID column
+    id: Mapped[int] = mapped_column(
+        Integer,           # Database column type: Integer
+        primary_key=True,  # Each task gets a unique primary key
+        index=True         # Create an index for faster ID lookups
+    )
+
+    # Define the title column
+    title: Mapped[str] = mapped_column(
+        String(200)        # String column with maximum 200 characters
+    )
+
+    # Define the completed column
+    completed: Mapped[bool] = mapped_column(
+        Boolean,           # Database column type: Boolean
+        default=False      # New tasks are incomplete by default
+    )
+
+
+# ==========================================
+# 2. PYDANTIC MODEL - INPUT VALIDATION
+# ==========================================
+
+# This model validates data received from the client
+class TaskCreate(BaseModel):
+
+    # Task title is required and must be a string
     title: str
+
+    # completed is optional
+    # If the client doesn't provide it, default is False
     completed: bool = False
 
-# Define the structure of a task response
+
+# ==========================================
+# 3. PYDANTIC MODEL - API RESPONSE
+# ==========================================
+
+# This model defines the structure of API responses
 class TaskResponse(BaseModel):
+
+    # Allow Pydantic to read data directly from
+    # SQLAlchemy objects using their attributes
+    model_config = ConfigDict(from_attributes=True)
+
+    # Fields returned to the client
     id: int
     title: str
     completed: bool
 
-# Temporary in-memory task storage
-tasks = [
-    {
-        "id": 1,
-        "title": "Learn FastAPI",
-        "completed": False
-    }
-]
+
+# ==========================================
+# 4. CREATE DATABASE TABLE
+# ==========================================
+
+# Create all tables defined using Base
+# If the tasks table already exists, it won't recreate it
+Base.metadata.create_all(bind=engine)
 
 
-# GET: Welcome endpoint
+# ==========================================
+# 5. HOME ROUTE
+# ==========================================
+
+# GET endpoint to check whether the API is running
 @app.get("/")
 def home():
-    return {"message": "Welcome to TaskFlow API"}
+
+    # Return a simple JSON response
+    return {"message": "TaskFlow API is running"}
 
 
-# GET: Retrieve all tasks
-@app.get("/tasks")
-def get_tasks(completed: bool | None = None):
-    if completed is None:
-        return tasks
+# ==========================================
+# 6. GET ALL TASKS
+# ==========================================
 
-    return [
-        task for task in tasks
-        if task["completed"] == completed
-    ]
+# GET endpoint to retrieve all tasks
+# response_model ensures every returned task follows TaskResponse
+@app.get("/tasks", response_model=list[TaskResponse])
+def get_tasks(
+    db: Session = Depends(get_db)  # Get a database session from FastAPI
+):
 
-# Return a validated task response
-@app.get("/tasks/{task_id}", response_model=TaskResponse)
-def get_task(task_id: int):
-    for task in tasks:
-        if task["id"] == task_id:
-            return task
+    # Build a SELECT query to retrieve all tasks
+    result = db.scalars(select(TaskDB)).all()
 
-    raise HTTPException(
-        status_code=404,
-        detail="Task not found"
-    )
+    # Return all retrieved task records
+    return result
 
 
-# GET: Retrieve a single task
-@app.get("/tasks/{task_id}")
-def get_task(task_id: int):
-    for task in tasks:
-        if task["id"] == task_id:
-            return task
+# ==========================================
+# 7. CREATE A NEW TASK
+# ==========================================
 
-    raise HTTPException(
-        status_code=404,
-        detail="Task not found"
-    )
+# POST endpoint to create and save a new task
+# status_code=201 means resource successfully created
+@app.post("/tasks", response_model=TaskResponse, status_code=201)
+def create_task(
+    task: TaskCreate,                   # Validate incoming JSON data
+    db: Session = Depends(get_db)       # Get database session
+):
 
+    # Convert Pydantic model into a dictionary
+    # ** unpacks dictionary keys as keyword arguments
+    # Create a new SQLAlchemy database object
+    new_task = TaskDB(**task.model_dump())
 
-# POST: Create a new task
-@app.post("/tasks", status_code=201)
-def create_task(task: Task):
-    new_task = {
-        "id": max((t["id"] for t in tasks), default=0) + 1,
-        **task.model_dump()
-    }
+    # Add the new task to the database session
+    # It is not permanently saved yet
+    db.add(new_task)
 
-    tasks.append(new_task)
+    # Commit the transaction
+    # This permanently saves the task to PostgreSQL
+    db.commit()
+
+    # Refresh the object with values from the database
+    # For example, retrieve the automatically generated ID
+    db.refresh(new_task)
+
+    # Return the newly created task
     return new_task
 
 
-# PUT: Replace an existing task completely
-@app.put("/tasks/{task_id}")
-def replace_task(task_id: int, task: Task):
-    for index, existing_task in enumerate(tasks):
-        if existing_task["id"] == task_id:
-            updated_task = {
-                "id": task_id,
-                **task.model_dump()
-            }
+# ==========================================
+# 8. GET TASK BY ID
+# ==========================================
 
-            tasks[index] = updated_task
-            return updated_task
+# GET endpoint to retrieve one specific task
+# task_id comes from the URL
+@app.get("/tasks/{task_id}", response_model=TaskResponse)
+def get_task(
+    task_id: int,                       # Receive task ID from URL
+    db: Session = Depends(get_db)       # Get database session
+):
 
-    raise HTTPException(
-        status_code=404,
-        detail="Task not found"
-    )
+    # Search for a task using its primary key
+    # db.get() returns the task object or None
+    task = db.get(TaskDB, task_id)
 
+    # Check whether the requested task exists
+    if task is None:
 
-# PATCH: Update selected task fields
-@app.patch("/tasks/{task_id}")
-def update_task(task_id: int, changes: dict):
-    allowed_fields = {"title", "completed"}
-
-    # Reject unsupported fields
-    invalid_fields = set(changes) - allowed_fields
-    if invalid_fields:
+        # If not found, return HTTP 404 error
         raise HTTPException(
-            status_code=422,
-            detail=f"Invalid fields: {sorted(invalid_fields)}"
+            status_code=404,
+            detail="Task not found"
         )
 
-    # Validate changes using the Pydantic model
-    try:
-        validated_changes = Task.model_validate(
-            {
-                "title": "Temporary title",
-                **changes
-            }
-        ).model_dump(exclude_unset=False)
-
-        # Keep only fields actually supplied by the client
-        validated_changes = {
-            key: value
-            for key, value in validated_changes.items()
-            if key in changes
-        }
-    except Exception:
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid task data"
-        )
-
-    for task in tasks:
-        if task["id"] == task_id:
-            task.update(validated_changes)
-            return task
-
-    raise HTTPException(
-        status_code=404,
-        detail="Task not found"
-    )
-
-
-# DELETE: Remove a task
-@app.delete("/tasks/{task_id}")
-def delete_task(task_id: int):
-    for task in tasks:
-        if task["id"] == task_id:
-            tasks.remove(task)
-            return {"message": "Task deleted"}
-
-    raise HTTPException(
-        status_code=404,
-        detail="Task not found"
-    )
+    # Return the matching task
+    return task
